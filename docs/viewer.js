@@ -76,10 +76,11 @@ for (const part of panelization.parts) {
           surfaceObject(
             piece,
             panel.is_specialized ? colors.specialized : panel.is_unique ? colors.unique : colors.panel,
-            0.88,
+            1,
             offset,
             true,
             panel.is_specialized,
+            -4,
           ),
         );
       }
@@ -90,7 +91,7 @@ for (const part of panelization.parts) {
 document.querySelector("#stat-walls").textContent = panelization.summary.n_walls.toLocaleString();
 document.querySelector("#stat-panels").textContent = panelization.summary.total_panels.toLocaleString();
 document.querySelector("#stat-specialized").textContent = panelization.summary.total_specialized_panels.toLocaleString();
-document.querySelector("#stat-cost").textContent = `EUR ${Math.round(panelization.summary.cost_total).toLocaleString()}`;
+document.querySelector("#stat-cost").textContent = `CAD ${Math.round(panelization.summary.cost_total).toLocaleString()}`;
 
 wireToggle("#layer-building", groups.building);
 wireToggle("#layer-panels", groups.panels);
@@ -122,14 +123,22 @@ function resize() {
   renderer.setSize(clientWidth, clientHeight, false);
 }
 
-function surfaceObject(rings, color, opacity, offset, outline, specialized = false) {
+function surfaceObject(rings, color, opacity, offset, outline, specialized = false, depthBias = 0) {
   const group = new THREE.Group();
   const geometry = polygonGeometry(rings, offset);
+  const transparent = opacity < 1;
   const material = new THREE.MeshStandardMaterial({
     color,
     side: THREE.DoubleSide,
-    transparent: true,
+    transparent,
     opacity,
+    // Translucent layers must not write depth, or they occlude each other in draw order
+    // and speckle. Panels sit exactly coplanar with the wall they're cut from, so they
+    // also need a polygon offset to win the depth test cleanly instead of z-fighting it.
+    depthWrite: !transparent,
+    polygonOffset: depthBias !== 0,
+    polygonOffsetFactor: depthBias,
+    polygonOffsetUnits: depthBias,
   });
   const mesh = new THREE.Mesh(geometry, material);
   mesh.userData.specialized = specialized;

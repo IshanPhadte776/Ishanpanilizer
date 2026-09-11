@@ -24,7 +24,7 @@ def main():
     print(f"Panels: {summary['total_panels']}")
     print(f"Unique panels: {summary['total_unique_panels']}")
     print(f"Unique panel types: {summary['total_unique_types']}")
-    print(f"Estimated cost: EUR {summary['cost_total']:,.0f}")
+    print(f"Estimated cost: CAD {summary['cost_total']:,.0f}")
 
     if config.get("visualize", False):
         visualize_panels(panelization)

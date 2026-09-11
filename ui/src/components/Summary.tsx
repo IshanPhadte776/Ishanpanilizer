@@ -30,7 +30,7 @@ export function Summary({ panelization, settings, error }: SummaryProps) {
       <Metric label="Panels" value={summary.total_panels} />
       <Metric label="Unique" value={summary.total_unique_panels} />
       <Metric label="Specialized" value={summary.total_specialized_panels} />
-      <Metric label="Cost" value={totalCost} prefix="EUR " />
+      <Metric label="Cost" value={totalCost} prefix="CAD " />
     </section>
   );
 }

@@ -57,7 +57,7 @@ export function Controls({
           min={0}
           max={1000}
           step={25}
-          unit="EUR"
+          unit="CAD"
           decimals={0}
           onChange={(cost_per_unique_panel_type) => onSettingsChange({ ...settings, cost_per_unique_panel_type })}
         />
@@ -67,7 +67,7 @@ export function Controls({
           min={0}
           max={250}
           step={5}
-          unit="EUR"
+          unit="CAD"
           decimals={0}
           onChange={(cost_per_panel_element) => onSettingsChange({ ...settings, cost_per_panel_element })}
         />
@@ -117,9 +117,9 @@ function Slider({ label, value, min, max, step, unit, decimals = 1, onChange }: 
       <span>
         {label}
         <strong>
-          {unit === "EUR" ? "EUR " : ""}
+          {unit === "CAD" ? "CAD " : ""}
           {value.toFixed(decimals)}
-          {unit !== "EUR" ? ` ${unit}` : ""}
+          {unit !== "CAD" ? ` ${unit}` : ""}
         </strong>
       </span>
       <input
