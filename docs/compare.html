@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pipeline comparison</title>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.171.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.171.0/examples/jsm/"
+        }
+      }
+    </script>
+    <style>
+      html, body { margin: 0; height: 100%; background: #f5f7f9;
+                   font: 13px/1.5 system-ui, sans-serif; color: #1f2933; overflow: hidden; }
+      #wrap { display: flex; height: 100%; cursor: grab; }
+      #wrap:active { cursor: grabbing; }
+      .pane { position: relative; flex: 1 1 50%; min-width: 0; }
+      .pane + .pane { border-left: 1px solid #cbd2d9; }
+      canvas { display: block; width: 100%; height: 100%; }
+      .tag {
+        position: absolute; top: 12px; left: 12px; padding: 8px 12px;
+        background: rgba(255,255,255,0.9); border: 1px solid #d4dae2;
+        border-radius: 6px; pointer-events: none; max-width: calc(100% - 24px);
+      }
+      .tag b { display: block; }
+      .tag span { color: #52606d; font-size: 12px; }
+      #hint {
+        position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%);
+        padding: 6px 12px; background: rgba(255,255,255,0.9);
+        border: 1px solid #d4dae2; border-radius: 6px; color: #52606d;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="wrap">
+      <div class="pane">
+        <div class="tag"><b id="tag-left">Loading…</b><span id="sub-left"></span></div>
+        <canvas id="left"></canvas>
+      </div>
+      <div class="pane">
+        <div class="tag"><b id="tag-right">Loading…</b><span id="sub-right"></span></div>
+        <canvas id="right"></canvas>
+      </div>
+    </div>
+    <div id="hint">both views share one camera — drag to orbit, scroll to zoom</div>
+    <script type="module" src="compare_viewer.js"></script>
+  </body>
+</html>

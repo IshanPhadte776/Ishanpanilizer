@@ -2,7 +2,10 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
-const src = new URLSearchParams(location.search).get("src") ?? "model.glb";
+const params = new URLSearchParams(location.search);
+const src = params.get("src") ?? "model.glb";
+const label = params.get("label");
+document.title = label ? `${label} - model viewer` : "Model viewer";
 
 const canvas = document.querySelector("#scene");
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -70,9 +73,9 @@ new GLTFLoader().load(
     controls.target.set(0, size.y * 0.4, 0);
     controls.update();
 
-    document.querySelector("#hud-title").textContent = src;
+    document.querySelector("#hud-title").textContent = label ?? src;
     document.querySelector("#hud-sub").textContent =
-      `${meshes} meshes · ${size.x.toFixed(1)} × ${size.y.toFixed(1)} × ${size.z.toFixed(1)} m`;
+      `${src} · ${meshes} meshes · ${size.x.toFixed(1)} × ${size.y.toFixed(1)} × ${size.z.toFixed(1)} m`;
   },
   undefined,
   (error) => {
