@@ -8,3 +8,12 @@ matplotlib
 pydantic
 shapely
 uvicorn
+
+# IFC -> CityJSON pipeline (scripts/ifc_to_cityjson.py, scripts/sanitize_cityjson.py)
+ifcopenshell
+trimesh
+cjio
+# trimesh soft deps needed by the mesh-outline/planar-projection path
+scipy
+networkx
+rtree

@@ -15,18 +15,24 @@ Panilizer parses LoD3 CityJSON buildings and generates facade panel layouts. It 
 
 ## Interactive Demo
 
-This repository includes a static Three.js demo in `docs/`. It shows the original building and the generated panel layout with rotatable 3D controls and layer toggles.
+This repository includes a static Three.js demo in `docs/`. It shows the original building and the generated panel layout with rotatable 3D controls and layer toggles. It uses precomputed `docs/demo_building.json` / `docs/demo_panels.json`, so it needs no backend, UI build, or LoD3 input data.
 
-To view it locally:
+Run it with a single command (serves on port 8098 and opens your browser):
 
 ```powershell
-python -m http.server 8080 -d docs
+.\scripts\start_demo.ps1
+```
+
+Or serve it manually:
+
+```powershell
+python -m http.server 8098 -d docs
 ```
 
 Then open:
 
 ```text
-http://127.0.0.1:8080
+http://127.0.0.1:8098
 ```
 
 For GitHub Pages, set the Pages source to:
@@ -62,7 +68,7 @@ If `uvicorn`, `open3d`, or other Python packages are not found, make sure the vi
 
 ## Batch Run
 
-The default example uses `input/outputID2/Output/lod3.json` and writes `output/2_panels.json`.
+The default example uses `input/outputID2/model.json` and writes `output/2_panels.json`.
 
 ```powershell
 python main.py --config config/panelizer_config.json
@@ -124,7 +130,23 @@ VITE_API_BASE=http://127.0.0.1:8000
 
 ## Typical Development Flow
 
-Use two terminals:
+Start both the backend and the UI with a single command:
+
+```powershell
+.\scripts\start_all.ps1
+```
+
+This starts the backend, waits for `/health` to respond, then starts the UI dev server in the same terminal (installing UI dependencies on first run). Press `Ctrl+C` to stop both.
+
+If the UI shows `Failed to fetch`, the backend at `http://127.0.0.1:8000` is usually not running. Check it with:
+
+```powershell
+Invoke-WebRequest http://127.0.0.1:8000/health
+```
+
+### Running backend and UI separately
+
+If you want them in separate terminals instead (e.g. to see backend logs on their own):
 
 ```powershell
 # Terminal 1: backend
@@ -134,10 +156,4 @@ Use two terminals:
 ```powershell
 # Terminal 2: frontend
 .\scripts\start_ui.ps1
-```
-
-After a reboot, start both again. If the UI shows `Failed to fetch`, the backend at `http://127.0.0.1:8000` is usually not running. Check it with:
-
-```powershell
-Invoke-WebRequest http://127.0.0.1:8000/health
 ```

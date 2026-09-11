@@ -1,6 +1,6 @@
 {
-  "input_json": "input/outputID2/Output/lod3.json",
-  "output_json": "output/2_panels.json",
+  "input_json": "input/COLONEL_BY_CHILD_CARE_CENTRE_ifc4_2025_full/model.json",
+  "output_json": "output/COLONEL_BY_CHILD_CARE_CENTRE_ifc4_2025_full_panels.json",
   "selected_building_indices": [
     0
   ],
