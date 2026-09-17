@@ -1,4 +1,7 @@
 import json
+import os
+import threading
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -21,10 +24,28 @@ DEFAULT_CONFIG = {
     "cost_per_unique_panel_type": 250.0,
     "cost_per_panel_element": 45.0,
     "target_surface_types": ["WallSurface"],
+    # Basement/below-grade wall surfaces are tagged (not dropped) at extraction time
+    # specifically so this can toggle them back in -- default matches the old behaviour
+    # (basements were never panelizable at all).
+    "include_basement": False,
     "color_mode": "type",
     "tolerance": 0.0001,
     "precision": 6,
     "visualize": True,
+    # Off by default: a fresh worker pool costs 1.6-2.6s just to spawn (each Windows worker
+    # re-imports numpy/shapely/open3d from scratch), which is a net loss for a one-shot CLI
+    # run. It's only worth it with a PERSISTENT pool reused across many calls -- measured
+    # 3.6-7.6x faster once warm -- which is why the API layer turns this on and the CLI
+    # doesn't (see get_worker_pool). Also requires build_meshes=False: an open3d
+    # TriangleMesh can't be pickled back across the process boundary either.
+    "parallel": False,
+    # Layout re-roll. seed=None keeps the plain aligned grid (unchanged behaviour); set a
+    # seed to get a different-but-reproducible arrangement, and change it to re-roll.
+    "seed": None,
+    "origin_jitter": 1.0,   # 0..1, how far the grid origin may slide (x panel size)
+    "stagger": 0.0,         # fixed offset of alternate courses (x panel width); 0.5 = running bond
+    "stagger_jitter": 0.0,  # 0..1, extra random per-course offset (needs a seed)
+    "size_jitter": 0.0,     # 0..0.5, random +/- variation in panel size (needs a seed)
 }
 
 
@@ -141,15 +162,23 @@ def _wall_clip_data(projected_rings: list[np.ndarray]) -> dict:
     }
 
 
-def _edges(min_value: float, max_value: float, target_size: float, tolerance: float) -> list[float]:
+def _edges(min_value: float, max_value: float, target_size: float, tolerance: float,
+           offset: float = 0.0) -> list[float]:
+    """Grid lines spanning [min_value, max_value] at `target_size` intervals.
+
+    `offset` slides the grid so the first course is a partial panel instead of a full one.
+    That shift is what makes one seeded layout read differently from another -- with
+    offset 0 this reproduces the original aligned grid exactly.
+    """
     if target_size <= 0:
         raise ValueError("Panel width and height must be positive")
 
     edges = [float(min_value)]
-    current = float(min_value)
-    while current + target_size < max_value - tolerance:
+    current = float(min_value) - (float(offset) % target_size)
+    while current < max_value - tolerance:
+        if current > min_value + tolerance:
+            edges.append(float(current))
         current += target_size
-        edges.append(float(current))
     if abs(edges[-1] - max_value) > tolerance:
         edges.append(float(max_value))
     return edges
@@ -185,31 +214,43 @@ def _clip_panel_to_outer_boundary(candidate: dict, outer_polygon: Polygon, toler
     clipped = _valid_polygon(candidate["rectangle"].intersection(outer_polygon))
     if clipped.is_empty or clipped.area <= tolerance:
         return None
-    return clipped
+    # Intersection area can only shrink or preserve the rectangle's own area -- so it equals
+    # the rectangle's area exactly (within tolerance) iff the rectangle sits fully inside
+    # outer_polygon, i.e. wasn't clipped. That makes area comparison an exact stand-in for
+    # "did clipping actually change the shape", cheaper than the boolean ops call sites used
+    # to reach for (symmetric_difference / equals_exact) purely to answer that yes/no.
+    was_clipped = clipped.area < candidate["rectangle"].area - tolerance
+    return clipped, was_clipped
 
 
 def _subtract_openings_from_panel(clipped_to_outer, opening_union, tolerance: float):
     if opening_union.is_empty:
-        return clipped_to_outer
+        return clipped_to_outer, False
     clipped = _valid_polygon(clipped_to_outer.difference(opening_union))
     if clipped.is_empty or clipped.area <= tolerance:
-        return None
-    return clipped
+        return None, False
+    was_clipped = clipped.area < clipped_to_outer.area - tolerance
+    return clipped, was_clipped
 
 
 def _clip_panel_to_wall(candidate: dict, wall_clip_data: dict, tolerance: float):
-    clipped_to_outer = _clip_panel_to_outer_boundary(
+    outer_result = _clip_panel_to_outer_boundary(
         candidate,
         wall_clip_data["outer_polygon"],
         tolerance,
     )
-    if clipped_to_outer is None:
+    if outer_result is None:
         return None
-    return _subtract_openings_from_panel(
+    clipped_to_outer, boundary_clipped = outer_result
+
+    clipped, opening_clipped = _subtract_openings_from_panel(
         clipped_to_outer,
         wall_clip_data["opening_union"],
         tolerance,
     )
+    if clipped is None:
+        return None
+    return clipped, boundary_clipped or opening_clipped
 
 
 def _iter_polygons(geometry, tolerance: float = 0.0):
@@ -225,8 +266,9 @@ def _iter_polygons(geometry, tolerance: float = 0.0):
             yield from _iter_polygons(item, tolerance)
 
 
-def _normalize_panel_piece(polygon: Polygon, tolerance: float) -> Polygon | None:
-    polygon = _valid_polygon(polygon)
+def _normalize_panel_piece(polygon: Polygon, tolerance: float, already_valid: bool = False) -> Polygon | None:
+    if not already_valid:
+        polygon = _valid_polygon(polygon)
     if polygon.is_empty or polygon.area <= tolerance:
         return None
     if not isinstance(polygon, Polygon):
@@ -237,10 +279,19 @@ def _normalize_panel_piece(polygon: Polygon, tolerance: float) -> Polygon | None
     return polygon
 
 
-def _normalize_panel_geometry(geometry, tolerance: float) -> list[Polygon]:
+def _normalize_panel_geometry(geometry, tolerance: float, already_valid: bool = False) -> list[Polygon]:
+    """`already_valid=True` skips re-running shapely's `is_valid` check (and the `buffer(0)`
+    repair it can trigger) when the caller already validated `geometry` immediately before
+    calling this -- e.g. `_clip_panel_to_wall`'s result. GEOS overlay ops (intersection/
+    difference) don't introduce new invalidity beyond what that one check already covers,
+    and validity is inherited by every sub-geometry `.geoms` yields, so re-checking a
+    just-validated object (and every polygon extracted from it) is pure repeated work --
+    this was previously happening up to 3x for the same geometry on every panel.
+    """
+    source = geometry if already_valid else _valid_polygon(geometry)
     pieces = []
-    for polygon in _iter_polygons(_valid_polygon(geometry), tolerance):
-        normalized = _normalize_panel_piece(polygon, tolerance)
+    for polygon in _iter_polygons(source, tolerance):
+        normalized = _normalize_panel_piece(polygon, tolerance, already_valid=already_valid)
         if normalized is not None:
             pieces.append(normalized)
     return sorted(pieces, key=lambda item: (item.bounds[0], item.bounds[1], -item.area))
@@ -339,8 +390,8 @@ def _round(value: float, precision: int) -> float:
     return round(float(value), precision)
 
 
-def _panel_dimensions(candidate: dict, clipped_geometry) -> tuple[float, float]:
-    if clipped_geometry.equals_exact(candidate["rectangle"], tolerance=1e-8):
+def _panel_dimensions(candidate: dict, clipped_geometry, was_clipped: bool) -> tuple[float, float]:
+    if not was_clipped:
         return candidate["u1"] - candidate["u0"], candidate["v1"] - candidate["v0"]
     min_u, min_v, max_u, max_v = clipped_geometry.bounds
     return max_u - min_u, max_v - min_v
@@ -349,6 +400,7 @@ def _panel_dimensions(candidate: dict, clipped_geometry) -> tuple[float, float]:
 def _build_panel_record(
     candidate: dict,
     clipped_geometry,
+    was_clipped: bool,
     panel_width: float,
     panel_height: float,
     origin: np.ndarray,
@@ -357,13 +409,14 @@ def _build_panel_record(
     tolerance: float,
     precision: int,
 ) -> tuple[dict, list[Polygon]]:
-    polygons = _normalize_panel_geometry(clipped_geometry, tolerance)
-    width, height = _panel_dimensions(candidate, clipped_geometry)
+    # clipped_geometry was already validated by _clip_panel_to_wall right before this call
+    polygons = _normalize_panel_geometry(clipped_geometry, tolerance, already_valid=True)
+    width, height = _panel_dimensions(candidate, clipped_geometry, was_clipped)
     width = _round(width, precision)
     height = _round(height, precision)
     is_residual_width = abs((candidate["u1"] - candidate["u0"]) - panel_width) > tolerance
     is_residual_height = abs((candidate["v1"] - candidate["v0"]) - panel_height) > tolerance
-    is_clipped = clipped_geometry.symmetric_difference(candidate["rectangle"]).area > tolerance
+    is_clipped = was_clipped
 
     panel = {
         "name": candidate["name"],
@@ -392,6 +445,35 @@ def _build_panel_record(
     return panel, polygons
 
 
+def wall_layout(seed, wall_id: int, panel_width: float, panel_height: float, config: dict) -> dict:
+    """Per-wall grid placement. With no seed this is the plain aligned grid; with one it's a
+    reproducible re-roll -- the grid origin slides, courses stagger, panel size can vary.
+
+    The RNG is derived from (seed, wall_id) rather than consumed from a single shared stream,
+    so one wall's result doesn't shift when another wall's geometry changes.
+    """
+    if seed is None:
+        return {"u_offset": 0.0, "v_offset": 0.0, "stagger": float(config.get("stagger", 0.0)),
+                "stagger_jitter": 0.0, "width": panel_width, "height": panel_height, "rng": None}
+
+    rng = np.random.default_rng([int(seed), int(wall_id)])
+    origin_jitter = float(config.get("origin_jitter", 1.0))
+    size_jitter = float(config.get("size_jitter", 0.0))
+
+    width = panel_width * (1.0 + rng.uniform(-size_jitter, size_jitter)) if size_jitter else panel_width
+    height = panel_height * (1.0 + rng.uniform(-size_jitter, size_jitter)) if size_jitter else panel_height
+
+    return {
+        "u_offset": rng.uniform(0.0, width) * origin_jitter,
+        "v_offset": rng.uniform(0.0, height) * origin_jitter,
+        "stagger": float(config.get("stagger", 0.0)),
+        "stagger_jitter": float(config.get("stagger_jitter", 0.0)),
+        "width": width,
+        "height": height,
+        "rng": rng,
+    }
+
+
 def panelize_wall_surface(
     wall_surface: dict,
     wall_id: int,
@@ -399,34 +481,51 @@ def panelize_wall_surface(
     panel_height: float,
     tolerance: float = 0.0001,
     precision: int = 6,
+    layout: dict | None = None,
+    build_meshes: bool = True,
 ) -> tuple[dict, list]:
+    layout = layout or {"u_offset": 0.0, "v_offset": 0.0, "stagger": 0.0,
+                        "stagger_jitter": 0.0, "width": panel_width, "height": panel_height, "rng": None}
+    panel_width = layout["width"]
+    panel_height = layout["height"]
+
     origin, normal, horizontal_axis, vertical_axis = _wall_plane_axes(wall_surface)
     projected_rings = _project_rings(wall_surface, origin, horizontal_axis, vertical_axis)
     wall_clip_data = _wall_clip_data(projected_rings)
     wall_polygon = wall_clip_data["wall_polygon"]
     min_u, min_v, max_u, max_v = wall_polygon.bounds
-    u_edges = _edges(min_u, max_u, panel_width, tolerance)
-    v_edges = _edges(min_v, max_v, panel_height, tolerance)
+    v_edges = _edges(min_v, max_v, panel_height, tolerance, layout["v_offset"])
 
     panels = []
     panel_meshes = []
     skipped = 0
+    max_cols = 0
 
-    for col in range(len(u_edges) - 1):
-        for row in range(len(v_edges) - 1):
+    # u_edges are rebuilt per course so rows can stagger against each other; with no stagger
+    # and no jitter every row gets the same edges, i.e. the original aligned grid
+    for row in range(len(v_edges) - 1):
+        u_offset = layout["u_offset"] + layout["stagger"] * panel_width * (row % 2)
+        if layout["rng"] is not None and layout["stagger_jitter"]:
+            u_offset += layout["rng"].uniform(0.0, panel_width) * layout["stagger_jitter"]
+        u_edges = _edges(min_u, max_u, panel_width, tolerance, u_offset)
+        max_cols = max(max_cols, len(u_edges) - 1)
+
+        for col in range(len(u_edges) - 1):
             candidate = _candidate_panel(col, row, u_edges, v_edges)
             if not _candidate_touches_wall(candidate, wall_polygon, tolerance):
                 skipped += 1
                 continue
 
-            clipped = _clip_panel_to_wall(candidate, wall_clip_data, tolerance)
-            if clipped is None:
+            clip_result = _clip_panel_to_wall(candidate, wall_clip_data, tolerance)
+            if clip_result is None:
                 skipped += 1
                 continue
+            clipped, was_clipped = clip_result
 
             panel, polygons = _build_panel_record(
                 candidate,
                 clipped,
+                was_clipped,
                 panel_width,
                 panel_height,
                 origin,
@@ -436,15 +535,22 @@ def panelize_wall_surface(
                 precision,
             )
             panels.append(panel)
-            panel_meshes.append(
-                _mesh_from_panel_polygons(
-                    polygons,
-                    origin,
-                    horizontal_axis,
-                    vertical_axis,
-                    _panel_color(panel),
+            # panel_meshes (open3d TriangleMesh, one per panel) is only ever consumed by
+            # visualize_panels() for the local desktop viewer -- panelization_to_viewer_payload
+            # never sends it to the API/UI, and save_panel_json strips it before writing to
+            # disk. Building it anyway when nothing will use it costs a measured 22-25% of
+            # panelize time (0.4-0.7s), so it's skipped by default; build_meshes is threaded
+            # from config["visualize"], so `--visualize`/an explicit visualize:true still works.
+            if build_meshes:
+                panel_meshes.append(
+                    _mesh_from_panel_polygons(
+                        polygons,
+                        origin,
+                        horizontal_axis,
+                        vertical_axis,
+                        _panel_color(panel),
+                    )
                 )
-            )
 
     unique_types = {
         (panel["width"], panel["height"], panel["n_vertices"], panel["n_pieces"])
@@ -458,7 +564,7 @@ def panelize_wall_surface(
         "height": _round(max_v - min_v, precision),
         "area": _round(wall_polygon.area, precision),
         "n_openings": max(0, len(projected_rings) - 1),
-        "n_cols": len(u_edges) - 1,
+        "n_cols": max_cols,
         "n_rows": len(v_edges) - 1,
         "n_panels": len(panels),
         "n_unique_panels": sum(1 for panel in panels if panel["is_unique"]),
@@ -470,13 +576,66 @@ def panelize_wall_surface(
     return wall, panel_meshes
 
 
-def _wall_surfaces(building: dict) -> list[dict]:
+def _wall_surfaces(building: dict, include_basement: bool = False) -> list[dict]:
     if "surfaces" in building and "wall" in building["surfaces"]:
-        return building["surfaces"]["wall"]
-    return [
-        {"mesh": mesh, "rings": [np.asarray(mesh.vertices, dtype=float).tolist()], "semantic_type": "WallSurface"}
-        for mesh in building["meshes"]["wall"]
-    ]
+        walls = building["surfaces"]["wall"]
+    else:
+        walls = [
+            {"mesh": mesh, "rings": [np.asarray(mesh.vertices, dtype=float).tolist()], "semantic_type": "WallSurface"}
+            for mesh in building["meshes"]["wall"]
+        ]
+    if include_basement:
+        return walls
+    return [w for w in walls if not w.get("is_basement")]
+
+
+_WORKER_POOL: ProcessPoolExecutor | None = None
+_WORKER_POOL_LOCK = threading.Lock()
+
+
+def get_worker_pool() -> ProcessPoolExecutor:
+    """A process pool created once and reused for the life of this process.
+
+    Deliberately a module-level singleton, not created fresh per call: see the note on
+    DEFAULT_CONFIG["parallel"] for why a persistent pool is the whole point. Thread-safe
+    (double-checked locking) because FastAPI runs sync endpoints in a thread pool, so two
+    concurrent requests could race to create this on first use.
+    """
+    global _WORKER_POOL
+    if _WORKER_POOL is None:
+        with _WORKER_POOL_LOCK:
+            if _WORKER_POOL is None:
+                _WORKER_POOL = ProcessPoolExecutor(max_workers=os.cpu_count())
+    return _WORKER_POOL
+
+
+def shutdown_worker_pool():
+    """Release worker processes. Call this on app/process shutdown (e.g. a FastAPI
+    shutdown event) so they don't linger after the parent exits."""
+    global _WORKER_POOL
+    if _WORKER_POOL is not None:
+        _WORKER_POOL.shutdown(wait=False, cancel_futures=True)
+        _WORKER_POOL = None
+
+
+def _strip_unpicklable_wall_surface(wall_surface: dict) -> dict:
+    """wall_surface carries an open3d.TriangleMesh under "mesh" (built for the whole-
+    building 3D viewer) that panelize_wall_surface never reads -- only "rings",
+    "semantic_type" and "is_basement" matter here. open3d meshes can't cross a process
+    boundary at all (confirmed: pickling one raises TypeError), so this has to come off
+    before a wall_surface is handed to a worker."""
+    return {key: value for key, value in wall_surface.items() if key != "mesh"}
+
+
+def _panelize_wall_task(args: tuple) -> tuple[dict, list]:
+    """Top-level (picklable) entry point run in a worker process. build_meshes is always
+    False here: an open3d TriangleMesh can't be pickled back across the process boundary
+    either, so a parallel run and --visualize are mutually exclusive by construction (see
+    panelize_buildings, which only takes this path when build_meshes is already False)."""
+    wall_surface, wall_id, panel_width, panel_height, tolerance, precision, layout = args
+    return panelize_wall_surface(
+        wall_surface, wall_id, panel_width, panel_height, tolerance, precision, layout, build_meshes=False,
+    )
 
 
 def panelize_buildings(
@@ -491,6 +650,18 @@ def panelize_buildings(
     cost_per_panel_element = float(config["cost_per_panel_element"])
     tolerance = float(config["tolerance"])
     precision = int(config["precision"])
+    seed = config.get("seed")
+    seed = None if seed is None or seed == "" else int(seed)
+    include_basement = bool(config.get("include_basement", False))
+    # panel_meshes are only ever consumed by visualize_panels() (the local desktop viewer),
+    # gated behind this same flag -- skip building them entirely otherwise (see the note in
+    # panelize_wall_surface for why that's worth doing).
+    build_meshes = bool(config.get("visualize", False))
+    # Parallel execution and mesh-building are mutually exclusive: an open3d TriangleMesh
+    # can't cross the process boundary (see _panelize_wall_task), so this only applies when
+    # nothing needs meshes anyway -- which is already the common case (build_meshes is off
+    # by default; see its own note above).
+    use_parallel = bool(config.get("parallel", False)) and not build_meshes
 
     parts = []
     all_panel_meshes = []
@@ -503,22 +674,43 @@ def panelize_buildings(
     for building in buildings:
         wall_entries = []
         part_panel_meshes = []
-        for wall_index, wall_surface in enumerate(_wall_surfaces(building), start=1):
-            wall, wall_panel_meshes = panelize_wall_surface(
-                wall_surface,
-                wall_id=wall_index,
-                panel_width=panel_width,
-                panel_height=panel_height,
-                tolerance=tolerance,
-                precision=precision,
-            )
-            wall_entries.append(wall)
-            part_panel_meshes.extend(wall_panel_meshes)
-            total_unique_types.update(
-                (panel["width"], panel["height"], panel["n_vertices"], panel["n_pieces"])
-                for panel in wall["panels"]
-                if panel["is_unique"]
-            )
+        walls = list(enumerate(_wall_surfaces(building, include_basement), start=1))
+
+        if use_parallel and len(walls) > 1:
+            # ProcessPoolExecutor.map preserves input order in its output, so wall_entries
+            # ends up identical to the sequential loop below regardless of which worker
+            # actually finished a given wall first.
+            tasks = [
+                (
+                    _strip_unpicklable_wall_surface(wall_surface),
+                    wall_index,
+                    panel_width,
+                    panel_height,
+                    tolerance,
+                    precision,
+                    wall_layout(seed, wall_index, panel_width, panel_height, config),
+                )
+                for wall_index, wall_surface in walls
+            ]
+            workers = os.cpu_count() or 1
+            chunksize = max(1, len(tasks) // (workers * 4))
+            for wall, wall_panel_meshes in get_worker_pool().map(_panelize_wall_task, tasks, chunksize=chunksize):
+                wall_entries.append(wall)
+                part_panel_meshes.extend(wall_panel_meshes)
+        else:
+            for wall_index, wall_surface in walls:
+                wall, wall_panel_meshes = panelize_wall_surface(
+                    wall_surface,
+                    wall_id=wall_index,
+                    panel_width=panel_width,
+                    panel_height=panel_height,
+                    tolerance=tolerance,
+                    precision=precision,
+                    layout=wall_layout(seed, wall_index, panel_width, panel_height, config),
+                    build_meshes=build_meshes,
+                )
+                wall_entries.append(wall)
+                part_panel_meshes.extend(wall_panel_meshes)
 
         part_total_panels = sum(wall["n_panels"] for wall in wall_entries)
         part_total_unique_panels = sum(wall["n_unique_panels"] for wall in wall_entries)
@@ -529,6 +721,11 @@ def panelize_buildings(
             for panel in wall["panels"]
             if panel["is_unique"]
         }
+        # Single source of truth for the building-level aggregate too -- this already
+        # iterates every wall in wall_entries regardless of which branch (parallel or
+        # sequential) populated it, so it can't drift between the two the way a separate
+        # per-wall accumulator inside just one branch did.
+        total_unique_types.update(part_unique_types)
 
         parts.append({
             "building_id": building["id"],
@@ -554,6 +751,7 @@ def panelize_buildings(
             "cost_per_unique_panel_type": cost_per_unique_panel_type,
             "cost_per_panel_element": cost_per_panel_element,
             "target_surface_types": config["target_surface_types"],
+            "include_basement": include_basement,
             "color_mode": config["color_mode"],
         },
         "summary": {

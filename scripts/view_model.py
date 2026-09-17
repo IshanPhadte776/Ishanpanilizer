@@ -29,13 +29,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import ifcopenshell  # noqa: E402
+import ifcopenshell.util.placement as ifc_placement  # noqa: E402
 import trimesh  # noqa: E402
 import ifc_to_cityjson as conv  # noqa: E402  (same scripts/ directory)
 
 from src.building_parser import SEMANTIC_COLORS, build_lod3_building_dictionaries, semantic_key  # noqa: E402
 
 
-ENVELOPE_CLASSES = ["IfcWall", "IfcRoof", "IfcSlab", "IfcWindow", "IfcDoor"]
+ENVELOPE_CLASSES = ["IfcWall", "IfcRoof", "IfcSlab", "IfcWindow", "IfcDoor", "IfcPlate", "IfcMember"]
 
 IFC_CLASS_COLORS = {
     "IfcWall": [0.78, 0.66, 0.51],
@@ -43,6 +44,10 @@ IFC_CLASS_COLORS = {
     "IfcSlab": [0.50, 0.55, 0.55],
     "IfcWindow": [0.36, 0.68, 0.89],
     "IfcDoor": [0.90, 0.49, 0.13],
+    # Curtain walls (IfcCurtainWall) never carry their own geometry -- they're pure
+    # IsDecomposedBy containers over these two, which is why they're listed here instead:
+    "IfcPlate": [0.40, 0.70, 0.86],  # the glazing infill
+    "IfcMember": [0.45, 0.47, 0.50],  # mullions/transoms/framing
 }
 DEFAULT_COLOR = [0.74, 0.76, 0.78]
 
@@ -78,7 +83,11 @@ def load_ifc_meshes(ifc_path, classes, exterior_only):
                 skipped += 1
                 continue
 
-            items.append({"tri": tri, "color": IFC_CLASS_COLORS.get(element.is_a(), DEFAULT_COLOR)})
+            items.append({
+                "tri": tri,
+                "color": IFC_CLASS_COLORS.get(element.is_a(), DEFAULT_COLOR),
+                "group": element.is_a(),  # merge key for export_glb
+            })
             counts[element.is_a()] += 1
 
     return items, counts, skipped
@@ -105,7 +114,11 @@ def load_cityjson_meshes(cityjson_path, semantic_filter):
                 faces=np.asarray(mesh.triangles, dtype=np.int64),
                 process=False,
             )
-            items.append({"tri": tri, "color": SEMANTIC_COLORS.get(surface["semantic_type"], DEFAULT_COLOR)})
+            items.append({
+                "tri": tri,
+                "color": SEMANTIC_COLORS.get(surface["semantic_type"], DEFAULT_COLOR),
+                "group": surface["semantic_type"],  # merge key for export_glb
+            })
             counts[surface["semantic_type"]] += 1
 
     return items, counts, building
@@ -127,32 +140,128 @@ def as_o3d(items):
 
 
 def export_glb(items, path):
-    """Write the same geometry out as a GLB so it can be opened in the browser.
+    """Write the geometry out as a GLB so it can be opened in the browser, MERGED into one
+    mesh per class/semantic type rather than one mesh per element.
 
-    Each mesh gets an explicit non-metallic PBR material. Without one, glTF's default
+    Every mesh in a glTF scene is its own draw call, and a BIM model is thousands of tiny
+    elements: Glengarry is 18,621 elements but only 358k triangles -- 19 triangles per draw
+    call, mostly individual curtain-wall mullions. WebGL sustains roughly 1-3k draw calls a
+    frame, so that model stutters despite having *fewer* triangles than Frontenac (378k),
+    which renders fine at 5,369 elements. The bottleneck is draw-call count, not geometry
+    volume, so the fix is merging rather than decimating: it changes nothing about what is
+    drawn, and everything within a group already shares one material anyway.
+
+    Grouping is by (label, colour). Colour is the part that actually has to be uniform --
+    one material per merged mesh -- while the label just keeps the glTF node names readable
+    and keeps IFC classes from being welded to CityJSON semantics in overlay mode.
+
+    Each group gets an explicit non-metallic PBR material. Without one, glTF's default
     material applies (metallic 1.0), and a fully metallic surface with no environment map
     renders solid black in every compliant viewer.
     """
-    scene = trimesh.Scene()
-    for index, item in enumerate(items):
-        tri = item["tri"].copy()
+    groups = defaultdict(list)
+    for item in items:
+        tri = item["tri"]
         if len(tri.faces) == 0:
             continue
-        rgba = [*(float(c) for c in item["color"]), 1.0]
-        tri.visual = trimesh.visual.TextureVisuals(
+        groups[(item.get("group", "geometry"), tuple(float(c) for c in item["color"]))].append(tri)
+
+    scene = trimesh.Scene()
+    total_faces = 0
+    for (label, color), meshes in sorted(groups.items()):
+        # concatenate before assigning the material: merging meshes that already carry
+        # TextureVisuals makes trimesh try to reconcile materials per-mesh, which is both
+        # slower and pointless when the whole group is one flat colour
+        merged = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0].copy()
+        merged.visual = trimesh.visual.TextureVisuals(
             material=trimesh.visual.material.PBRMaterial(
-                baseColorFactor=rgba,
+                baseColorFactor=[*color, 1.0],
                 metallicFactor=0.0,
                 roughnessFactor=0.85,
                 doubleSided=True,
             )
         )
-        scene.add_geometry(tri, node_name=f"e{index}")
+        scene.add_geometry(merged, node_name=label)
+        total_faces += len(merged.faces)
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(trimesh.exchange.gltf.export_glb(scene))
-    print(f"Wrote {path} ({len(scene.geometry)} meshes)")
+
+    element_count = sum(len(meshes) for meshes in groups.values())
+    print(f"Wrote {path}")
+    print(f"  {element_count} elements -> {len(scene.geometry)} draw call(s), {total_faces:,} triangles")
+    for (label, _color), meshes in sorted(groups.items()):
+        print(f"    {label}: {len(meshes)} elements merged")
+
+
+def compute_grade_z(ifc_path):
+    """Z, in meters, in the raw pre-recentre project frame, of the lowest storey NOT
+    classified as below-grade -- i.e. where real ground level actually is.
+
+    Returns None when there's nothing to correct for (a single-storey file, or nothing
+    detected as a basement by detect_basement_storeys), in which case
+    recentre_far_from_origin's fallback -- put the model's lowest point at z=0 -- is
+    already the right call.
+    """
+    ifc_file = ifcopenshell.open(ifc_path)
+    storeys = [s for s in ifc_file.by_type("IfcBuildingStorey")
+               if "survey point" not in (s.Name or "").lower()]
+    if len(storeys) < 2:
+        return None
+
+    wall_storey, curtain_wall_storey, wall_count, glazing_count = conv.build_storey_glazing_index(ifc_file)
+    basement_ids = conv.detect_basement_storeys(ifc_file, wall_count, glazing_count, [])
+    if not basement_ids:
+        return None
+
+    storeys.sort(key=lambda s: s.Elevation if s.Elevation is not None else 0.0)
+    grade_storey = next((s for s in storeys if s.id() not in basement_ids), None)
+    if grade_storey is None:
+        return None
+
+    # get_local_placement returns the raw file units (mm for these projects); ifcopenshell.geom
+    # meshes are always meters, so the two frames only line up once this is scaled the same way.
+    unit_scale = conv.ifc_unit.calculate_unit_scale(ifc_file)
+    matrix = ifc_placement.get_local_placement(grade_storey.ObjectPlacement)
+    return float(matrix[2, 3]) * unit_scale
+
+
+def recentre_far_from_origin(items, grade_z=None):
+    """Shift geometry (in float64, in place) so it sits near the origin before it ever
+    reaches a float32 buffer, and so that z=0 means the grid represents actual ground
+    level rather than "whatever the model's lowest point happens to be."
+
+    Revit/IFC exports routinely carry real survey coordinates (easting/northing in the
+    hundreds of thousands to millions of meters) even though the building itself only
+    spans tens of meters. glTF/GLB stores vertex positions as float32, which only has
+    ~7 significant decimal digits -- at a magnitude of ~5,000,000 that leaves a rounding
+    step of roughly half a meter, so vertices snap to a coarse grid and every frame's
+    view-matrix multiply lands on a slightly different grid point: the model visibly
+    jitters/"shakes" even with a perfectly static camera. Recentring afterwards at the
+    Object3D/transform level (as the browser viewer used to) does not fix this -- the
+    precision is already lost by the time the vertex leaves this script. The fix has to
+    happen here, on the raw float64 coordinates, before export.
+
+    `grade_z` (from compute_grade_z) lets basement storeys land below z=0/the grid
+    instead of being the thing that defines z=0 -- without it, a basement's floor slab is
+    the model's lowest point, so the old "sit the lowest point on the grid" behaviour
+    would put the basement ON the grid rather than under it.
+    """
+    verts = [it["tri"].vertices for it in items if len(it["tri"].vertices)]
+    if not verts:
+        return
+    bbox_min = np.min([v.min(axis=0) for v in verts], axis=0)
+    bbox_max = np.max([v.max(axis=0) for v in verts], axis=0)
+    z_ref = grade_z if grade_z is not None else bbox_min[2]
+    offset = np.array([(bbox_min[0] + bbox_max[0]) / 2.0, (bbox_min[1] + bbox_max[1]) / 2.0, z_ref])
+
+    reason = "grade level (basement will sit below z=0)" if grade_z is not None else "the model's lowest point"
+    print(f"Recentring: shifting by {-offset} so {reason} is at the origin "
+          f"(source coordinates were ~{np.linalg.norm(offset):,.0f} m from it).")
+    for it in items:
+        if len(it["tri"].vertices):
+            it["tri"].vertices = it["tri"].vertices - offset
 
 
 def to_wireframe(meshes, color):
@@ -243,6 +352,11 @@ def main():
         cj_items, counts, building = load_cityjson_meshes(args.cityjson, semantic_filter)
         describe(f"CityJSON {Path(args.cityjson).name}", counts, f" [lod {building['lod']}]")
         titles.append("CityJSON")
+
+    grade_z = compute_grade_z(args.ifc) if args.ifc else None
+    if grade_z is not None:
+        print(f"Detected a basement -- grade level is at z={grade_z:.3f} m in the source file's frame.")
+    recentre_far_from_origin(ifc_items + cj_items, grade_z=grade_z)
 
     if args.list:
         return

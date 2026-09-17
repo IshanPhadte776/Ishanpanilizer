@@ -8,6 +8,7 @@ matplotlib
 pydantic
 shapely
 uvicorn
+python-multipart
 
 # IFC -> CityJSON pipeline (scripts/ifc_to_cityjson.py, scripts/sanitize_cityjson.py)
 ifcopenshell

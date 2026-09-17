@@ -108,9 +108,12 @@ def _semantic_info(geometry: dict, surface_index: int) -> dict:
         if surface.get("is_reveal"):
             qualifiers.append("reveal")
         semantic_type = f"{base_type}:{':'.join(qualifiers)}" if qualifiers else base_type
-        return {"semantic_type": semantic_type, "semantic_index": sem_idx}
+        # Kept as its own explicit flag (not folded into semantic_type/category) so callers
+        # can filter it as a toggle -- e.g. panelizer._wall_surfaces(building, include_basement)
+        # -- without a below-grade wall changing which category/color bucket it lands in.
+        return {"semantic_type": semantic_type, "semantic_index": sem_idx, "is_basement": bool(surface.get("is_basement"))}
 
-    return {"semantic_type": "Unknown", "semantic_index": None}
+    return {"semantic_type": "Unknown", "semantic_index": None, "is_basement": False}
 
 
 def _category(semantic_type: str) -> str:
@@ -381,6 +384,7 @@ def build_lod3_building_dictionaries(cityjson_input):
                         "semantic_key": sem_key,
                         "semantic_index": info["semantic_index"],
                         "surface_index": surface_index,
+                        "is_basement": info["is_basement"],
                     }
                     parts.append(mesh)
                     meshes[_category(sem_type)].append(mesh)

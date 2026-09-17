@@ -35,6 +35,13 @@ param(
     [string]$CityJson,
     [double]$PanelWidth = 0,
     [double]$PanelHeight = 0,
+    [string]$Seed,
+    [int]$Search = 0,
+    [ValidateSet("cost", "types", "panels")]
+    [string]$Objective = "cost",
+    [switch]$KeepBaseline,
+    [double]$OriginJitter = -1,
+    [double]$Stagger = -1,
     [int]$Port = 8098,
     [switch]$NoServe
 )
@@ -66,18 +73,35 @@ if float(sys.argv[2]) > 0:
     cfg['panel_width'] = float(sys.argv[2])
 if float(sys.argv[3]) > 0:
     cfg['panel_height'] = float(sys.argv[3])
+if sys.argv[4] != '-':
+    cfg['seed'] = None if sys.argv[4].lower() in ('none','null','off') else int(sys.argv[4])
+if float(sys.argv[5]) >= 0:
+    cfg['origin_jitter'] = float(sys.argv[5])
+if float(sys.argv[6]) >= 0:
+    cfg['stagger'] = float(sys.argv[6])
 with open(p, 'w') as fh:
     json.dump(cfg, fh, indent=2)
 print('input : %s' % cfg['input_json'])
 print('panel : %s x %s m' % (cfg['panel_width'], cfg['panel_height']))
+print('layout: seed=%s origin_jitter=%s stagger=%s' % (cfg.get('seed'), cfg.get('origin_jitter'), cfg.get('stagger')))
 "@
 
 $cityJsonArg = if ($CityJson) { $CityJson } else { "-" }
+$seedArg = if ($PSBoundParameters.ContainsKey('Seed')) { $Seed } else { "-" }
 
 Write-Host ""
 Write-Host "== Panelizing existing CityJSON (no IFC re-conversion) ==" -ForegroundColor Yellow
-& $python -c $configUpdate $cityJsonArg $PanelWidth $PanelHeight
+& $python -c $configUpdate $cityJsonArg $PanelWidth $PanelHeight $seedArg $OriginJitter $Stagger
 if ($LASTEXITCODE -ne 0) { throw "Failed to update config/panelizer_config.json" }
+
+if ($Search -gt 0) {
+    Write-Host ""
+    Write-Host "== Searching $Search seeded layouts (minimising $Objective) ==" -ForegroundColor Yellow
+    $searchArgs = @((Join-Path "scripts" "search_layouts.py"), "--trials", $Search, "--objective", $Objective)
+    if ($KeepBaseline) { $searchArgs += "--keep-baseline" }
+    & $python $searchArgs
+    if ($LASTEXITCODE -ne 0) { throw "search_layouts.py failed (exit $LASTEXITCODE)" }
+}
 
 Write-Host ""
 & $python (Join-Path $root "main.py") --config (Join-Path "config" "panelizer_config.json")

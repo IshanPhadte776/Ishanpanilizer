@@ -22,10 +22,18 @@
       }
       #hud b { display: block; margin-bottom: 4px; }
       #hud span { color: #52606d; }
+      #hud-stats {
+        margin-top: 6px; padding-top: 6px; border-top: 1px solid #e1e7ed; color: #52606d;
+      }
+      #hud-stats strong { color: #1f2933; }
     </style>
   </head>
   <body>
-    <div id="hud"><b id="hud-title">Loading…</b><span id="hud-sub"></span></div>
+    <div id="hud">
+      <b id="hud-title">Loading…</b>
+      <span id="hud-sub"></span>
+      <div id="hud-stats"></div>
+    </div>
     <canvas id="scene"></canvas>
     <script type="module" src="model_viewer.js"></script>
   </body>

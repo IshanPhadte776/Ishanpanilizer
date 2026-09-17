@@ -26,6 +26,13 @@ def main():
     print(f"Unique panel types: {summary['total_unique_types']}")
     print(f"Estimated cost: CAD {summary['cost_total']:,.0f}")
 
+    timings = panelization.get("timings")
+    if timings:
+        print(
+            f"Time: {timings['total_ms'] / 1000:.2f}s "
+            f"(model load {timings['model_ms'] / 1000:.2f}s + panelize {timings['panelize_ms'] / 1000:.2f}s)"
+        )
+
     if config.get("visualize", False):
         visualize_panels(panelization)
 

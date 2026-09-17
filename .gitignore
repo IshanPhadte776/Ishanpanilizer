@@ -13,6 +13,9 @@ __pycache__/
 # Output
 output/
 
+# Models uploaded via the "Upload model & Panelize" button (src/api.py POST /upload)
+input/uploads/
+
 # Frontend
 ui/node_modules/
 ui/dist/

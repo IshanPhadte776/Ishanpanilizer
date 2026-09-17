@@ -15,7 +15,9 @@ Usage:
 """
 import argparse
 import json
+import os
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -56,7 +58,9 @@ def classify_wall(wall, warnings):
     for props in psets.values():
         if "Workset" in props:
             workset = str(props["Workset"]).strip().upper()
-            if "EXTERIOR" in workset:
+            # "SHELL" is Frontenac/Glengarry's Workset convention for envelope walls,
+            # alongside Colonel By's "EXTERIORS"/"INTERIORS" -- different firms, same idea.
+            if "EXTERIOR" in workset or workset == "SHELL":
                 return True, "workset"
             if "INTERIOR" in workset:
                 return False, "workset"
@@ -66,6 +70,17 @@ def classify_wall(wall, warnings):
         return True, "typename"
     if "-INT-" in tname:
         return False, "typename"
+
+    # Frontenac/Glengarry use a WE-/WP-/WF- type-mark prefix (Wall Exterior / Partition /
+    # Foundation) instead of Colonel By's "-EXT-"/"-INT-" substring convention. WF (Wall
+    # Foundation) is deliberately NOT treated as exterior here -- it shows up on far more
+    # storeys than just the basement, so it reads as a structural/shear-wall designation
+    # rather than a reliable facade signal; leave it falling through to "excluded" below.
+    prefix = tname.split(":")[-1].split("-")[0].strip()
+    if prefix == "WE":
+        return True, "typename_prefix"
+    if prefix.startswith("WP"):
+        return False, "typename_prefix"
 
     warnings.append(f"wall {wall.GlobalId} ({tname or 'untyped'}): no Workset/type-name signal, excluding")
     return False, "unknown"
@@ -96,6 +111,66 @@ def classify_slab(slab, warnings):
     return False, "unknown"
 
 
+def build_storey_glazing_index(ifc_file):
+    """Per-storey wall/glazing counts, and wall-id/curtain-wall-id -> storey-id maps,
+    straight from real IFC spatial containment (IfcRelContainedInSpatialStructure) -- not
+    from storey naming or elevation, neither of which is a reliable basement signal (see
+    detect_basement_storeys)."""
+    wall_storey = {}
+    curtain_wall_storey = {}
+    wall_count = defaultdict(int)
+    glazing_count = defaultdict(int)
+    for rel in ifc_file.by_type("IfcRelContainedInSpatialStructure"):
+        storey = rel.RelatingStructure
+        if not storey.is_a("IfcBuildingStorey"):
+            continue
+        for el in rel.RelatedElements:
+            if el.is_a("IfcWall"):
+                wall_storey[el.id()] = storey.id()
+                wall_count[storey.id()] += 1
+            elif el.is_a("IfcCurtainWall"):
+                curtain_wall_storey[el.id()] = storey.id()
+                glazing_count[storey.id()] += 1
+            elif el.is_a("IfcWindow"):
+                glazing_count[storey.id()] += 1
+    return wall_storey, curtain_wall_storey, wall_count, glazing_count
+
+
+def detect_basement_storeys(ifc_file, wall_count, glazing_count, warnings):
+    """Identify below-grade storeys by what's actually built on them, not by storey number
+    or elevation sign -- neither holds up across projects. A storey named "LV1" can be a
+    building's main occupied ground floor (elevation deeply negative relative to its own
+    survey point, e.g. Colonel By) or a genuine basement (Frontenac); a low storey number
+    or a negative elevation shows up in both cases, so it can't tell them apart.
+
+    What does tell them apart: a real basement is underground, so it has no facade glazing
+    -- zero windows, zero curtain walls -- while every occupied floor above grade has some.
+    Walk the storeys bottom-up by elevation and flag a contiguous run of glazing-free
+    storeys starting at the lowest one; stop at the first storey that has any windows or
+    curtain walls (that's daylight, so it's above grade) or that has no walls at all (an
+    empty storey is a modeling artifact, not evidence either way -- don't guess past it).
+    """
+    storeys = [s for s in ifc_file.by_type("IfcBuildingStorey")
+               if "survey point" not in (s.Name or "").lower()]
+    if len(storeys) < 2:
+        return set()
+    storeys.sort(key=lambda s: s.Elevation if s.Elevation is not None else 0.0)
+
+    basement_ids = set()
+    for storey in storeys:
+        if wall_count[storey.id()] == 0 or glazing_count[storey.id()] > 0:
+            break
+        basement_ids.add(storey.id())
+
+    if basement_ids and len(basement_ids) < len(storeys):
+        names = [s.Name for s in storeys if s.id() in basement_ids]
+        warnings.append(
+            f"treating storey(s) {', '.join(names)} as below-grade/basement (bottom of the "
+            "stack, zero windows or curtain walls) -- excluding their exterior walls from panelization"
+        )
+    return basement_ids
+
+
 def build_host_openings(ifc_file):
     """host wall id -> [(opening_element, filling_element), ...] for openings that are actually filled by a window/door."""
     opening_to_host = {}
@@ -122,14 +197,7 @@ def make_settings():
     return settings
 
 
-def create_mesh(element, settings):
-    # ifcopenshell.geom (with USE_WORLD_COORDS) returns coordinates already
-    # normalized to meters regardless of the file's declared length unit --
-    # verified empirically against this file's own mm-declared Qto data.
-    try:
-        shape = ifcopenshell.geom.create_shape(settings, element)
-    except Exception:
-        return None
+def _shape_to_mesh(shape):
     verts = np.asarray(shape.geometry.verts, dtype=float).reshape(-1, 3)
     faces = np.asarray(shape.geometry.faces, dtype=np.int64).reshape(-1, 3)
     if len(faces) == 0 or len(verts) == 0:
@@ -141,18 +209,69 @@ def create_mesh(element, settings):
     return mesh
 
 
+def build_mesh_cache(ifc_file, settings, classes):
+    """Every element's mesh, computed once, up front, via ifcopenshell's own multi-threaded
+    iterator -- not the one create_shape() call per element the rest of this file used to
+    make. Profiled: create_shape is 81% of total extraction time (single-threaded, ~82ms/
+    element), and the per-element approach separately computed the SAME exterior wall's
+    geometry twice over (once for the occluder pass over all walls, again in prepare_wall
+    for that wall specifically) -- this cache removes both costs, since every caller now
+    shares one lookup keyed by element id instead of each calling create_shape on its own.
+    Measured 2.1-2.4x faster than the old approach even before removing that duplication.
+    """
+    cache = {}
+    iterator = ifcopenshell.geom.iterator(settings, ifc_file, num_threads=os.cpu_count() or 4, include=classes)
+    if not iterator.initialize():
+        return cache
+    while True:
+        shape = iterator.get()
+        mesh = _shape_to_mesh(shape)
+        if mesh is not None:
+            cache[shape.id] = mesh
+        if not iterator.next():
+            break
+    return cache
+
+
+def create_mesh(element, settings, cache=None):
+    # ifcopenshell.geom (with USE_WORLD_COORDS) returns coordinates already
+    # normalized to meters regardless of the file's declared length unit --
+    # verified empirically against this file's own mm-declared Qto data.
+    if cache is not None:
+        cached = cache.get(element.id())
+        if cached is not None:
+            return cached.copy()
+        # not in the cache (e.g. a class build_mesh_cache wasn't asked to include) --
+        # fall through to computing it directly rather than assuming "no geometry"
+    try:
+        shape = ifcopenshell.geom.create_shape(settings, element)
+    except Exception:
+        return None
+    return _shape_to_mesh(shape)
+
+
 # ------------------------------------------------------------ face select
 
-def build_occluder(walls, settings, warnings):
+def build_occluder(walls, settings, warnings, mesh_cache=None, is_ext_by_id=None):
     """Concatenated wall geometry plus, per face, which element it came from and whether
-    that element is an interior wall. Ray hits are only interpretable with those labels."""
+    that element is an interior wall. Ray hits are only interpretable with those labels.
+
+    `is_ext_by_id` reuses classify_wall's result from main()'s own ext/int/finish sort
+    instead of calling it again here for the same 6,000+ walls -- profiled at ~8s of
+    redundant pset lookups on Glengarry (12,478 classify_wall calls for 6,401 elements is
+    exactly 2x, one from main(), one from here, before this fix).
+    """
     meshes, owners, interior, ids = [], [], [], []
     for wall in walls:
-        mesh = create_mesh(wall, settings)
+        mesh = create_mesh(wall, settings, cache=mesh_cache)
         if mesh is None:
             continue
         owners.append(np.full(len(mesh.faces), len(ids), dtype=np.int64))
-        interior.append(not classify_wall(wall, warnings)[0])
+        if is_ext_by_id is not None and wall.id() in is_ext_by_id:
+            is_ext = is_ext_by_id[wall.id()]
+        else:
+            is_ext = classify_wall(wall, warnings)[0]
+        interior.append(not is_ext)
         ids.append(wall.id())
         meshes.append(mesh)
 
@@ -511,6 +630,111 @@ def merged_match_region(mesh, facets, grid_size):
     }
 
 
+# --------------------------------------------------------- curtain walls
+
+def curtain_wall_children_mesh(curtain_wall, settings, mesh_cache=None):
+    """Concatenate geometry from a curtain wall's real geometry carriers.
+
+    IfcCurtainWall itself never has its own shape -- in this file all 61 are pure
+    IsDecomposedBy containers over IfcPlate (glazing infill) and IfcMember (mullions/
+    transoms). Walk the decomposition (it can nest) and collect those two types.
+    """
+    children = []
+    stack = list(getattr(curtain_wall, "IsDecomposedBy", []) or [])
+    seen = set()
+    while stack:
+        rel = stack.pop()
+        for child in rel.RelatedObjects:
+            if child.id() in seen:
+                continue
+            seen.add(child.id())
+            if child.is_a("IfcPlate") or child.is_a("IfcMember"):
+                children.append(child)
+            stack.extend(getattr(child, "IsDecomposedBy", []) or [])
+
+    meshes = [m for m in (create_mesh(c, settings, cache=mesh_cache) for c in children) if m is not None]
+    if not meshes:
+        return None
+    return trimesh.util.concatenate(meshes)
+
+
+def curtain_wall_window_records_from_mesh(mesh, label, angle_tol_deg, plane_tol, min_facet_area, grid_size):
+    """The CPU-heavy half of curtain-wall processing: clustering the merged plate/member
+    mesh into facade planes and filling each into one 'Window'. Pure numpy/shapely/trimesh,
+    no ifcopenshell dependency -- split out from build_curtain_wall_window_records
+    specifically so it can run in a worker process (see main()): profiled as the single
+    biggest cost on a curtain-wall-heavy building (39.5s of ~70s total on Glengarry's 320
+    curtain walls, once the create_shape bottleneck elsewhere was already fixed).
+
+    The individual IfcPlate/IfcMember pieces don't physically touch each other, so
+    cluster_planar_facets's connectivity split -- correct for a solid wall -- would hand
+    back hundreds of tiny disconnected facets here instead of one plane. Re-group those by
+    plane, then reuse merged_match_region's hull-union trick (built for the same
+    "disconnected pieces on one plane" problem on wall openings) to fill across the gaps.
+
+    Returns (records, warnings) rather than appending to a shared warnings list, since a
+    list mutated inside a worker process wouldn't be visible to the caller's own copy.
+    """
+    warnings = []
+    facets = [f for f in cluster_planar_facets(mesh, angle_tol_deg, plane_tol) if f["area"] >= 0.01]
+    if not facets:
+        warnings.append(f"{label}: no usable facets, skipped")
+        return [], warnings
+
+    cos_tol = np.cos(np.radians(angle_tol_deg))
+    groups = []
+    for facet in sorted(facets, key=lambda f: -f["area"]):
+        for group in groups:
+            ref = group[0]
+            if ref["normal"] @ facet["normal"] > cos_tol and \
+                    abs((facet["origin"] - ref["origin"]) @ ref["normal"]) < plane_tol:
+                group.append(facet)
+                break
+        else:
+            groups.append([facet])
+
+    records = []
+    for group in groups:
+        region = merged_match_region(mesh, group, grid_size)
+        if region is None or region["poly"].area < min_facet_area:
+            continue
+        records.append({"semantic_type": "Window", "rings": polygon_to_3d_rings(region["poly"], region["to_3D"])})
+
+    if not records:
+        warnings.append(f"{label}: empty/degenerate boundary, skipped")
+    return records, warnings
+
+
+def _curtain_wall_task(args):
+    """Top-level (picklable) entry point for a worker process -- see main()'s use of
+    ProcessPoolExecutor over curtain_wall_window_records_from_mesh."""
+    label, mesh, angle_tol_deg, plane_tol, min_facet_area, grid_size = args
+    return curtain_wall_window_records_from_mesh(mesh, label, angle_tol_deg, plane_tol, min_facet_area, grid_size)
+
+
+def build_curtain_wall_window_records(curtain_wall, settings, angle_tol_deg, plane_tol,
+                                       min_facet_area, grid_size, warnings, mesh_cache=None):
+    """Emit one merged 'Window' surface per facade plane of a curtain wall, instead of its
+    real mullion/panel grid -- per the user's call: a curtain wall becomes one giant window,
+    so the panelizer (which only targets WallSurface) leaves it alone entirely.
+
+    Sequential single-curtain-wall convenience wrapper around curtain_wall_children_mesh
+    (ifcopenshell-dependent, must run in-process) + curtain_wall_window_records_from_mesh
+    (the parallelizable part). main() calls those two directly instead of this, to batch
+    the mesh-gathering here and dispatch the heavy part across a process pool.
+    """
+    label = f"IfcCurtainWall {curtain_wall.GlobalId}"
+    mesh = curtain_wall_children_mesh(curtain_wall, settings, mesh_cache=mesh_cache)
+    if mesh is None:
+        warnings.append(f"{label}: no plate/member geometry, skipped")
+        return []
+    records, new_warnings = curtain_wall_window_records_from_mesh(
+        mesh, label, angle_tol_deg, plane_tol, min_facet_area, grid_size,
+    )
+    warnings.extend(new_warnings)
+    return records
+
+
 def build_facet_data(mesh, facets, grid_size, warnings, label):
     """Boundary polygons (own holes stripped) for a set of already-selected facets."""
     facet_data = []
@@ -566,11 +790,11 @@ def match_opening(filling_mesh, filling_normal, facet_data):
 
 
 def prepare_wall(wall, settings, occluder, angle_tol_deg, plane_tol, min_facet_area,
-                 ray_eps, ray_max_dist, min_open, grid_size, warnings):
+                 ray_eps, ray_max_dist, min_open, grid_size, warnings, mesh_cache=None):
     """This wall's mesh, its facets (pre-merge, kept for the same-wall fallback), and their
     boundary polygons. Geometry only -- no opening matching happens here."""
     label = f"wall {wall.GlobalId}"
-    mesh = create_mesh(wall, settings)
+    mesh = create_mesh(wall, settings, cache=mesh_cache)
     if mesh is None:
         warnings.append(f"{label}: no geometry, skipped")
         return None
@@ -594,7 +818,7 @@ def prepare_wall(wall, settings, occluder, angle_tol_deg, plane_tol, min_facet_a
     return {"wall": wall, "label": label, "mesh": mesh, "facets": facets, "facet_data": facet_data}
 
 
-def match_wall_openings(info, host_openings, settings, grid_size, warnings):
+def match_wall_openings(info, host_openings, settings, grid_size, warnings, mesh_cache=None):
     """Match this wall's own declared openings against its own facets (fine, then a
     same-wall merged fallback for curved walls). Returns the matched Window/Door records,
     plus (filling, filling_mesh, filling_normal) for any that still failed -- those get one
@@ -609,7 +833,7 @@ def match_wall_openings(info, host_openings, settings, grid_size, warnings):
     matches = {}
     unmatched_indices = []
     for index, (_opening, filling) in enumerate(openings):
-        filling_mesh = create_mesh(filling, settings)
+        filling_mesh = create_mesh(filling, settings, cache=mesh_cache)
         if filling_mesh is None:
             continue
         filling_normal = dominant_normal(filling_mesh)
@@ -658,7 +882,8 @@ def match_wall_openings(info, host_openings, settings, grid_size, warnings):
             _coverage, footprint, fd = matches[index]
             sem = "Window" if filling.is_a("IfcWindow") else "Door"
             trimmed = clean_polygon(footprint, grid_size) or footprint
-            records.append({"semantic_type": sem, "rings": polygon_to_3d_rings(trimmed, fd["to_3D"])})
+            records.append({"semantic_type": sem, "rings": polygon_to_3d_rings(trimmed, fd["to_3D"]),
+                            "is_basement": info["is_basement"]})
 
             if fd is region:
                 # Placed via the merged region, so cut it from whichever fine facets it
@@ -719,7 +944,10 @@ def match_nearby_fallback(info, unmatched, wall_infos, grid_size, warnings, max_
             fd["cuts"].append(footprint)
             sem = "Window" if filling.is_a("IfcWindow") else "Door"
             trimmed = clean_polygon(footprint, grid_size) or footprint
-            records.append({"semantic_type": sem, "rings": polygon_to_3d_rings(trimmed, fd["to_3D"])})
+            # tagged by the wall it actually landed in (best_other), not the one that
+            # declared it -- that's the wall whose facet/storey it's physically cut into
+            records.append({"semantic_type": sem, "rings": polygon_to_3d_rings(trimmed, fd["to_3D"]),
+                            "is_basement": best_other["is_basement"]})
             warnings.append(
                 f"{filling.is_a()} {filling.GlobalId}: declared host ({info['label']}) doesn't geometrically "
                 f"contain it, but neighboring {best_other['label']} does ({coverage:.0%}) -- IFC void/fill "
@@ -743,16 +971,17 @@ def finalize_walls(wall_infos, grid_size, warnings):
                     wall_poly = cut
                 else:
                     warnings.append(f"{info['label']}: opening subtraction emptied a facet, keeping it uncut")
-            records.append({"semantic_type": "WallSurface", "rings": polygon_to_3d_rings(wall_poly, fd["to_3D"])})
+            records.append({"semantic_type": "WallSurface", "rings": polygon_to_3d_rings(wall_poly, fd["to_3D"]),
+                            "is_basement": info["is_basement"]})
         if len(info["facet_data"]) > 1:
             warnings.append(f"{info['label']}: multi-segment wall split into {len(info['facet_data'])} facets")
     return records
 
 
 def build_flat_record(element, settings, semantic_type, preferred_dir, angle_tol_deg, plane_tol,
-                      min_facet_area, grid_size, warnings):
+                      min_facet_area, grid_size, warnings, mesh_cache=None):
     label = f"{element.is_a()} {element.GlobalId}"
-    mesh = create_mesh(element, settings)
+    mesh = create_mesh(element, settings, cache=mesh_cache)
     if mesh is None:
         # IfcRoof is often just an aggregate container whose real surfaces are child
         # IfcSlabs; those get picked up separately, so this isn't a loss
@@ -826,10 +1055,17 @@ def assemble_cityjson(building_name, records, precision):
         ring_indices = [[pool.add(pt) for pt in ring] for ring in rec["rings"]]
         boundaries.append(ring_indices)
         sem_type = rec["semantic_type"]
-        if sem_type not in semantic_type_index:
-            semantic_type_index[sem_type] = len(semantic_surfaces)
-            semantic_surfaces.append({"type": sem_type})
-        values.append(semantic_type_index[sem_type])
+        is_basement = bool(rec.get("is_basement"))
+        # keyed on (type, is_basement) so a below-grade WallSurface gets its own semantic
+        # surface entry distinct from a regular one, instead of collapsing together
+        key = (sem_type, is_basement)
+        if key not in semantic_type_index:
+            semantic_type_index[key] = len(semantic_surfaces)
+            surface = {"type": sem_type}
+            if is_basement:
+                surface["is_basement"] = True
+            semantic_surfaces.append(surface)
+        values.append(semantic_type_index[key])
 
     return {
         "type": "CityJSON",
@@ -907,14 +1143,25 @@ def main():
     walls = ifc_file.by_type("IfcWall")
     roofs = ifc_file.by_type("IfcRoof")
     slabs = ifc_file.by_type("IfcSlab")
+    curtain_walls = ifc_file.by_type("IfcCurtainWall")
+
+    wall_storey, curtain_wall_storey, storey_wall_count, storey_glazing_count = build_storey_glazing_index(ifc_file)
+    basement_storey_ids = detect_basement_storeys(ifc_file, storey_wall_count, storey_glazing_count, warnings)
 
     # Finish layers (e.g. this file's 13 "EXT-WL_05mm-PAINT" walls) are modeled as their own
     # IfcWall elements sitting coplanar on top of the real wall. They host no openings, so
     # they render as solid panels burying the windows cut into the wall behind them, and
     # they double-count facade area. A 5mm "wall" is paint, not a claddable surface.
+    #
+    # Below-grade walls are TAGGED, not dropped: they still go through the same extraction
+    # (finalize_walls stamps is_basement on their records below), so the panelizer can
+    # toggle them in or out (default off) instead of them being unrecoverably absent.
     ext_walls, int_walls, finish_walls = [], [], []
+    basement_wall_ids = set()
+    is_ext_by_id = {}
     for w in walls:
         is_ext, _ = classify_wall(w, warnings)
+        is_ext_by_id[w.id()] = is_ext
         if not is_ext:
             int_walls.append(w)
             continue
@@ -923,6 +1170,8 @@ def main():
             finish_walls.append(w)
             continue
         ext_walls.append(w)
+        if wall_storey.get(w.id()) in basement_storey_ids:
+            basement_wall_ids.add(w.id())
 
     if finish_walls:
         warnings.append(
@@ -935,11 +1184,33 @@ def main():
         is_ext, _ = classify_slab(s, warnings)
         (roof_bucket if is_ext else ground_bucket).append(s)
 
+    # Curtain walls become one giant Window per facade plane (see build_curtain_wall_window_records)
+    # rather than real panels -- classify_wall works unchanged since it's generic over psets/type-name.
+    ext_curtain_walls, int_curtain_walls, basement_curtain_walls = [], [], []
+    for cw in curtain_walls:
+        is_ext, _ = classify_wall(cw, warnings)
+        if not is_ext:
+            int_curtain_walls.append(cw)
+        elif curtain_wall_storey.get(cw.id()) in basement_storey_ids:
+            basement_curtain_walls.append(cw)
+        else:
+            ext_curtain_walls.append(cw)
+
     host_openings = build_host_openings(ifc_file)
+
+    # Every element this file ever calls create_mesh() on, computed once via ifcopenshell's
+    # multi-threaded iterator instead of one single-threaded create_shape() call apiece --
+    # see build_mesh_cache. This is also what removes the old duplicate work where an
+    # exterior wall's geometry was built once for the occluder pass (all walls) and again
+    # in prepare_wall (that wall specifically): both now hit the same cache entry.
+    mesh_cache = build_mesh_cache(
+        ifc_file, settings,
+        ["IfcWall", "IfcRoof", "IfcSlab", "IfcWindow", "IfcDoor", "IfcPlate", "IfcMember"],
+    )
 
     # occluder includes INTERIOR walls too: a room's far side is often a partition, and that's
     # exactly what has to block the ray for an inner leaf to be recognised as internal
-    occluder = build_occluder(walls, settings, warnings)
+    occluder = build_occluder(walls, settings, warnings, mesh_cache=mesh_cache, is_ext_by_id=is_ext_by_id)
     if occluder is None:
         raise SystemExit("No wall geometry could be created from this IFC file.")
 
@@ -949,13 +1220,15 @@ def main():
     for wall in ext_walls:
         info = prepare_wall(wall, settings, occluder, args.angle_tol, args.plane_tol,
                             args.min_facet_area, args.ray_eps, args.ray_max_dist,
-                            args.min_open, args.precision, warnings)
+                            args.min_open, args.precision, warnings, mesh_cache=mesh_cache)
         if info is not None:
+            info["is_basement"] = wall.id() in basement_wall_ids
             wall_infos.append(info)
 
     all_unmatched = []  # (info, [(filling, filling_mesh, filling_normal), ...])
     for info in wall_infos:
-        recs, unmatched = match_wall_openings(info, host_openings, settings, args.precision, warnings)
+        recs, unmatched = match_wall_openings(info, host_openings, settings, args.precision, warnings,
+                                              mesh_cache=mesh_cache)
         records.extend(recs)
         if unmatched:
             all_unmatched.append((info, unmatched))
@@ -968,10 +1241,43 @@ def main():
 
     for roof in roof_bucket:
         records.extend(build_flat_record(roof, settings, "RoofSurface", WORLD_UP, args.angle_tol,
-                                         args.plane_tol, args.min_facet_area, args.precision, warnings))
+                                         args.plane_tol, args.min_facet_area, args.precision, warnings,
+                                         mesh_cache=mesh_cache))
     for slab in ground_bucket:
         records.extend(build_flat_record(slab, settings, "GroundSurface", WORLD_DOWN, args.angle_tol,
-                                         args.plane_tol, args.min_facet_area, args.precision, warnings))
+                                         args.plane_tol, args.min_facet_area, args.precision, warnings,
+                                         mesh_cache=mesh_cache))
+    # Curtain walls, in two phases. Phase 1 (here, sequential): gather each one's merged
+    # plate/member mesh -- needs the live ifcopenshell file, so has to run in this process,
+    # but is fast now that mesh_cache means no create_shape call happens in this step.
+    curtain_wall_tasks = []
+    for cw in ext_curtain_walls:
+        label = f"IfcCurtainWall {cw.GlobalId}"
+        mesh = curtain_wall_children_mesh(cw, settings, mesh_cache=mesh_cache)
+        if mesh is None:
+            warnings.append(f"{label}: no plate/member geometry, skipped")
+            continue
+        curtain_wall_tasks.append((label, mesh, args.angle_tol, args.plane_tol, args.min_facet_area, args.precision))
+
+    # Phase 2: the clustering/merging work itself is pure numpy/shapely/trimesh with no
+    # ifcopenshell dependency (unlike everything else in this file), so it can run across a
+    # process pool. Profiled as the single biggest remaining cost on a curtain-wall-heavy
+    # building (39.5s of ~70s total on Glengarry's 320 curtain walls) -- worth a one-shot
+    # pool's spawn cost even in this single CLI invocation, unlike panelizer.py's per-wall
+    # tasks (a few ms each), where a fresh pool was a net loss: each curtain wall here
+    # averages ~120ms of real work, so the spawn cost amortizes easily.
+    if len(curtain_wall_tasks) > 8:
+        workers = os.cpu_count() or 4
+        chunksize = max(1, len(curtain_wall_tasks) // (workers * 4))
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            for recs, new_warnings in pool.map(_curtain_wall_task, curtain_wall_tasks, chunksize=chunksize):
+                records.extend(recs)
+                warnings.extend(new_warnings)
+    else:
+        for label, mesh, a_tol, p_tol, min_area, grid in curtain_wall_tasks:
+            recs, new_warnings = curtain_wall_window_records_from_mesh(mesh, label, a_tol, p_tol, min_area, grid)
+            records.extend(recs)
+            warnings.extend(new_warnings)
 
     ground_slab_zs = []
     for rec in records:
@@ -995,8 +1301,13 @@ def main():
 
     print(f"Source IFC: {args.ifc}")
     print(f"Declared file unit scale to meters (informational; geometry is already in meters): {declared_unit_scale}")
-    print(f"Walls: {len(walls)} total -> {len(ext_walls)} exterior, {len(int_walls)} interior (excluded)")
+    print(f"Walls: {len(walls)} total -> {len(ext_walls)} exterior, {len(int_walls)} interior (excluded); "
+          f"{len(basement_wall_ids)} of those exterior walls are below-grade (tagged is_basement, "
+          f"excluded from panelization unless include_basement is set)")
     print(f"Roofs: {len(roofs)}, Slabs: {len(slabs)} ({len(roof_bucket) - len(roofs)} exterior-slab + {len(roofs)} roof -> roof bucket, {len(ground_bucket)} -> ground bucket)")
+    print(f"Curtain walls: {len(curtain_walls)} total -> {len(ext_curtain_walls)} exterior (emitted as one "
+          f"Window each, per facade plane), {len(int_curtain_walls)} interior (excluded), "
+          f"{len(basement_curtain_walls)} below-grade (excluded)")
     print("Surface counts in output:")
     for sem_type, count in sorted(counts.items()):
         print(f"  {sem_type}: {count}")

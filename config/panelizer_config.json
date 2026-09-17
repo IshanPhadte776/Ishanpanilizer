@@ -1,6 +1,7 @@
 {
-  "input_json": "input/COLONEL_BY_CHILD_CARE_CENTRE_ifc4_2025_full/model.json",
-  "output_json": "output/COLONEL_BY_CHILD_CARE_CENTRE_ifc4_2025_full_panels.json",
+  "input_json": "input/FRONTENAC_HOUSE/model.json",
+  "output_json": "output/FRONTENAC_HOUSE_panels.json",
+  "include_basement": false,
   "selected_building_indices": [
     0
   ],
@@ -12,5 +13,7 @@
     "WallSurface"
   ],
   "color_mode": "type",
-  "visualize": false
+  "visualize": false,
+  "seed": 7,
+  "origin_jitter": 0.3
 }
